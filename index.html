@@ -75,10 +75,10 @@ main { max-width:480px; margin:0 auto; padding:18px 16px 40px; }
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=3"></script>
 <script>
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(function(e){ console.warn('SW failed', e); });
+  navigator.serviceWorker.register('sw.js?v=3').catch(function(e){ console.warn('SW failed', e); });
 }
 window.addEventListener('beforeinstallprompt', function (e) {
   e.preventDefault();
