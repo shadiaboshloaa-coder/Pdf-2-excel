@@ -1,0 +1,13 @@
+{
+  "name": "محوّل PDF إلى Excel",
+  "short_name": "PDF2Excel",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f4f6f8",
+  "theme_color": "#1F4E78",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    { "src": "icon.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
