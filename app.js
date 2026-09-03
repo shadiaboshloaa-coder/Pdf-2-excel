@@ -121,6 +121,16 @@ function looksLikeBrokenArabicEncoding(text) {
 // تجميع العناصر في صفوف وأعمدة.
 // rtl=true يجعل ترتيب الأعمدة من اليمين لليسار، وهو الأنسب للصفحات العربية.
 // ---------------------------------------------------------------------------
+
+function looksLikeBrokenArabicItem(text) {
+  if (!text) return false;
+  const value = text.trim();
+  if (value.length < 3) return false;
+  const suspicious = countMatches(value, SUSPICIOUS_ENCODING_RE);
+  const arabic = countMatches(value, ARABIC_GLOBAL_RE);
+  return suspicious >= 2 && arabic === 0;
+}
+
 function clusterRows(items, rtl = false) {
   if (!items.length) return [];
 
@@ -233,6 +243,7 @@ async function extractTextPage(page) {
   const rtl = isRtlText(rawText);
 
   return {
+    items,
     table: itemsToTable(items, rtl),
     totalLen,
     rawText,
@@ -242,15 +253,90 @@ async function extractTextPage(page) {
 }
 
 // ---------------------------------------------------------------------------
-// OCR — يتم تشغيله فقط عندما تحتاج الصفحة لذلك.
-// ara+eng أفضل للملفات المختلطة عربي + إنجليزي + أرقام.
+// OCR — لا نعمل OCR للصفحة كلها عندما يكون الـPDF نصيًا لكن العربي مكسور.
+// بدل ذلك نحافظ على إحداثيات PDF الأصلية ونصحح فقط العناصر العربية المكسورة.
+// هذا مهم جدًا للجداول: الأرقام والتواريخ والأعمدة تظل في أماكنها الأصلية.
 // ---------------------------------------------------------------------------
-async function extractOcrPage(page, statusPrefix) {
-  const viewport = page.getViewport({ scale: 2.4 });
+async function ensureOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+
+  ocrWorker = await Tesseract.createWorker("ara+eng", 1, {
+    logger: (m) => {
+      if (m.status === "recognizing text") {
+        setStatus(Math.round(m.progress * 100), "جاري تصحيح النص العربي...");
+      }
+    },
+  });
+
+  try {
+    await ocrWorker.setParameters({
+      preserve_interword_spaces: "1",
+      user_defined_dpi: "300",
+    });
+  } catch (e) {
+    console.warn("OCR parameters warning:", e);
+  }
+
+  return ocrWorker;
+}
+
+function cleanOcrText(text) {
+  return (text || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasUsefulArabic(text) {
+  const n = countMatches(text || "", ARABIC_GLOBAL_RE);
+  return n >= 2;
+}
+
+// OCR لعنصر/سطر واحد من الصفحة. لا نلمس بقية عناصر الـPDF.
+async function ocrBrokenItem(pageCanvas, item, scale) {
+  const pad = 14 * scale;
+  const x = Math.max(0, Math.floor(item.x0 * scale - pad));
+  const y = Math.max(0, Math.floor(item.top * scale - pad));
+  const right = Math.min(pageCanvas.width, Math.ceil(item.x1 * scale + pad));
+  const bottom = Math.min(pageCanvas.height, Math.ceil((item.top + item.height) * scale + pad));
+
+  const width = Math.max(20, right - x);
+  const height = Math.max(20, bottom - y);
+
+  const crop = document.createElement("canvas");
+  crop.width = width;
+  crop.height = height;
+  const ctx = crop.getContext("2d", { willReadFrequently: false });
+
+  // أبيض نظيف خلف النص يقلل تأثير خلفية الصفحة/الخطوط.
+  ctx.fillStyle = "white";
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(pageCanvas, x, y, width, height, 0, 0, width, height);
+
+  const worker = await ensureOcrWorker();
+  try {
+    // كل عنصر هنا عبارة عن سطر/خلية قصيرة، وPSM 7 أنسب من OCR صفحة كاملة.
+    await worker.setParameters({ tessedit_pageseg_mode: "7" });
+  } catch (_) {}
+
+  const result = await worker.recognize(crop);
+  const text = cleanOcrText(result?.data?.text || "");
+
+  // لا نستبدل النص إلا إذا كان OCR أعاد عربيًا حقيقيًا.
+  return hasUsefulArabic(text) ? text : null;
+}
+
+async function repairBrokenArabicItems(page, extracted, statusPrefix) {
+  const brokenItems = extracted.items.filter(it => looksLikeBrokenArabicItem(it.text));
+  if (!brokenItems.length) return extracted;
+
+  if (!ocrToggle.checked) return extracted;
+
+  const scale = 3.5;
+  const viewport = page.getViewport({ scale });
   const canvas = document.createElement("canvas");
   canvas.width = Math.ceil(viewport.width);
   canvas.height = Math.ceil(viewport.height);
-
   const ctx = canvas.getContext("2d", { willReadFrequently: false });
 
   await page.render({
@@ -259,42 +345,70 @@ async function extractOcrPage(page, statusPrefix) {
     intent: "print",
   }).promise;
 
-  if (!ocrWorker) {
-    setStatus(0, statusPrefix + " جاري تحميل محرك القراءة العربية...");
+  setStatus(0, `${statusPrefix} تصحيح ${brokenItems.length} جزء عربي...`);
 
-    ocrWorker = await Tesseract.createWorker("ara+eng", 1, {
-      logger: (m) => {
-        if (m.status === "recognizing text") {
-          setStatus(
-            Math.round(m.progress * 100),
-            statusPrefix + " قراءة الصفحة OCR جارية..."
-          );
-        }
-      },
-    });
-
-    // تحسين عام للصفحات التي تحتوي على كتلة نصية/جدول.
-    try {
-      await ocrWorker.setParameters({
-        preserve_interword_spaces: "1",
-        user_defined_dpi: "300",
-      });
-    } catch (e) {
-      // بعض إصدارات Tesseract قد لا تدعم كل الإعدادات؛ لا نوقف التحويل.
-      console.warn("OCR parameters warning:", e);
-    }
+  const replacements = new Map();
+  for (let i = 0; i < brokenItems.length; i++) {
+    const item = brokenItems[i];
+    const fixed = await ocrBrokenItem(canvas, item, scale);
+    if (fixed) replacements.set(item, fixed);
+    setStatus(
+      Math.round(((i + 1) / brokenItems.length) * 100),
+      `${statusPrefix} تصحيح العربي ${i + 1} من ${brokenItems.length}...`
+    );
   }
 
-  const { data } = await ocrWorker.recognize(canvas);
+  const repairedItems = extracted.items.map(item => ({
+    ...item,
+    text: replacements.get(item) || item.text,
+  }));
+
+  const rawText = repairedItems.map(x => x.text).join(" ");
+  const rtl = isRtlText(rawText);
+
+  return {
+    ...extracted,
+    items: repairedItems,
+    rawText,
+    rtl,
+    table: itemsToTable(repairedItems, rtl),
+    brokenEncoding: false,
+    repairedArabic: replacements.size,
+  };
+}
+
+// OCR كامل فقط للـPDFs التي لا تحتوي على طبقة نص مفيدة (سكان/صور).
+async function extractOcrPage(page, statusPrefix) {
+  const viewport = page.getViewport({ scale: 3.0 });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+
+  const ctx = canvas.getContext("2d", { willReadFrequently: false });
+  await page.render({
+    canvasContext: ctx,
+    viewport,
+    intent: "print",
+  }).promise;
+
+  const worker = await ensureOcrWorker();
+  try {
+    await worker.setParameters({
+      tessedit_pageseg_mode: "6",
+      preserve_interword_spaces: "1",
+      user_defined_dpi: "300",
+    });
+  } catch (_) {}
+
+  setStatus(0, statusPrefix + " OCR عربي + إنجليزي للصفحة...");
+  const { data } = await worker.recognize(canvas);
   const ocrText = data.text || "";
   const rtl = isRtlText(ocrText);
 
   const items = [];
-
   for (const w of data.words || []) {
     const t = (w.text || "").trim();
     if (!t) continue;
-
     items.push({
       text: t,
       top: w.bbox.y0,
@@ -304,11 +418,7 @@ async function extractOcrPage(page, statusPrefix) {
     });
   }
 
-  return {
-    table: itemsToTable(items, rtl),
-    text: ocrText,
-    rtl,
-  };
+  return { table: itemsToTable(items, rtl), text: ocrText, rtl };
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +444,22 @@ async function convertOneFile(file) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const totalPages = pdf.numPages;
 
+  // كل PDF = شيت واحد فقط.
+  // صفحات الـPDF تُضاف تحت بعضها بالترتيب داخل نفس الشيت.
   const workbook = new ExcelJS.Workbook();
+  const ws = workbook.addWorksheet("البيانات", {
+    views: [
+      {
+        rightToLeft: true,
+        state: "frozen",
+        ySplit: 1,
+      },
+    ],
+  });
+
+  let currentRow = 1;
+  let firstTableHeader = null;
+  let sheetRtl = true;
 
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
     setStatus(
@@ -346,64 +471,76 @@ async function convertOneFile(file) {
     const extracted = await extractTextPage(page);
 
     // قرار OCR يتم لكل صفحة على حدة.
-    const needsOcr =
-      extracted.totalLen < MIN_TEXT_LEN_FOR_TEXT_PAGE ||
-      extracted.brokenEncoding;
-
+    const needsFullOcr = extracted.totalLen < MIN_TEXT_LEN_FOR_TEXT_PAGE;
+    let repaired = extracted;
     let table = extracted.table;
     let sourceNote = "نص PDF";
 
-    if (needsOcr) {
+    if (needsFullOcr) {
       if (ocrToggle.checked) {
-        setStatus(
-          Math.round(((pageNum - 1) / totalPages) * 100),
-          `${file.name}: الصفحة ${pageNum} تحتاج OCR — جاري القراءة...`
-        );
-
         const ocr = await extractOcrPage(
           page,
           `${file.name} - صفحة ${pageNum}:`
         );
-
         table = ocr.table;
-        sourceNote =
-          extracted.totalLen < MIN_TEXT_LEN_FOR_TEXT_PAGE
-            ? "OCR تلقائي (صفحة صورة/بدون نص)"
-            : "OCR تلقائي (تم اكتشاف ترميز نص مكسور)";
+        repaired = { ...extracted, rtl: ocr.rtl };
+        sourceNote = "OCR تلقائي (صفحة صورة/بدون نص)";
       } else {
-        sourceNote = "نص مكسور/صورة — OCR متوقف";
+        sourceNote = "صفحة صورة/بدون نص — OCR متوقف";
       }
+    } else if (extracted.brokenEncoding) {
+      repaired = await repairBrokenArabicItems(
+        page,
+        extracted,
+        `${file.name} - صفحة ${pageNum}:`
+      );
+      table = repaired.table;
+      sourceNote = repaired.repairedArabic
+        ? `تم تصحيح العربي تلقائيًا (${repaired.repairedArabic} جزء)`
+        : "نص PDF — لم يتم العثور على OCR عربي موثوق";
     }
 
-    const sheetName = `صفحة ${pageNum}`.slice(0, 31);
-
-    const ws = workbook.addWorksheet(sheetName, {
-      views: [
-        {
-          rightToLeft: extracted.rtl,
-          state: "frozen",
-          ySplit: 1,
-        },
-      ],
-    });
-
     if (!table.length) {
-      ws.getCell("A1").value =
-        "⚠️ لم يتم العثور على محتوى قابل للاستخراج في هذه الصفحة";
       continue;
     }
 
-    const maxCols = Math.max(...table.map(r => r.length));
-    const colWidths = new Array(maxCols).fill(MIN_COL_WIDTH);
+    // نستخدم اتجاه أول صفحة للشيت كله.
+    if (pageNum === 1) {
+      sheetRtl = !!repaired.rtl;
+      ws.views[0].rightToLeft = sheetRtl;
+      firstTableHeader = table[0].map(normalizeCellValue);
+    }
 
-    table.forEach((row, rIdx) => {
-      const isHeader = rIdx === 0;
+    // لو الصفحة التالية فيها نفس رأس الجدول الموجود في أول صفحة،
+    // نتجاهله حتى تكون كل البيانات متصلة تحت بعضها بدون تكرار رؤوس الصفحات.
+    let rowsToWrite = table;
+    if (pageNum > 1 && firstTableHeader && table.length) {
+      const candidate = table[0].map(normalizeCellValue);
+      if (sameHeader(candidate, firstTableHeader)) {
+        rowsToWrite = table.slice(1);
+      }
+    }
+
+    if (!rowsToWrite.length) continue;
+
+    // سطر فاصل بسيط بين الصفحات، بدون إنشاء Sheet جديد.
+    if (pageNum > 1 && currentRow > 1) {
+      currentRow++;
+    }
+
+    const maxCols = Math.max(...rowsToWrite.map(r => r.length));
+    const colWidths = [];
+    for (let c = 0; c < maxCols; c++) {
+      colWidths[c] = ws.getColumn(c + 1).width || MIN_COL_WIDTH;
+    }
+
+    rowsToWrite.forEach((row, rIdx) => {
+      const isHeader = pageNum === 1 && rIdx === 0;
 
       for (let c = 0; c < maxCols; c++) {
         const raw = normalizeCellValue(row[c]);
-        const cell = ws.getCell(rIdx + 1, c + 1);
+        const cell = ws.getCell(currentRow + rIdx, c + 1);
 
-        // نخلي الأرقام والتواريخ أرقام/تواريخ Excel بدل تحويلها لنص كلما أمكن.
         if (looksLikeNumber(raw) && !looksLikeDate(raw)) {
           const numeric = Number(raw.replace(/,/g, ""));
           cell.value = Number.isFinite(numeric) ? numeric : raw;
@@ -442,7 +579,7 @@ async function convertOneFile(file) {
         } else {
           cell.font = { name: "Arial", size: 11 };
           cell.alignment = {
-            horizontal: extracted.rtl ? "right" : "left",
+            horizontal: sheetRtl ? "right" : "left",
             vertical: "middle",
             wrapText: true,
           };
@@ -459,15 +596,18 @@ async function convertOneFile(file) {
       ws.getColumn(idx + 1).width = w;
     });
 
-    const noteRow = table.length + 3;
-    ws.getCell(noteRow, 1).value = `(مصدر الاستخراج: ${sourceNote})`;
-    ws.getCell(noteRow, 1).font = {
-      name: "Arial",
-      size: 8,
-      italic: true,
-      color: { argb: "FF888888" },
-    };
+    currentRow += rowsToWrite.length;
   }
+
+  if (currentRow === 1) {
+    ws.getCell("A1").value =
+      "⚠️ لم يتم العثور على محتوى قابل للاستخراج في هذا الملف";
+  }
+
+  ws.autoFilter = {
+    from: "A1",
+    to: `${ws.getColumn(ws.columnCount).letter}1`,
+  };
 
   setStatus(95, `${file.name}: جاري حفظ ملف الإكسل...`);
 
@@ -478,7 +618,6 @@ async function convertOneFile(file) {
 
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-
   a.href = url;
   a.download = file.name.replace(/\.pdf$/i, "") + ".xlsx";
 
@@ -487,4 +626,11 @@ async function convertOneFile(file) {
   document.body.removeChild(a);
 
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// مقارنة بسيطة لرؤوس الجداول لمنع تكرار Header كل صفحة.
+function sameHeader(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  const norm = v => normalizeCellValue(v).replace(/\s+/g, "").toLowerCase();
+  return a.every((v, i) => norm(v) === norm(b[i]));
 }

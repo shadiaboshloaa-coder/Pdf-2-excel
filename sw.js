@@ -1,5 +1,5 @@
 // Service worker — versioned cache so updated app.js is actually used.
-const CACHE_NAME = "pdf2excel-cache-v3";
+const CACHE_NAME = "pdf2excel-cache-v5";
 const CORE_ASSETS = [
   "./",
   "./index.html",
