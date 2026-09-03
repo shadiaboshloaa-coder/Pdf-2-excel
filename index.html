@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>محوّل PDF إلى Excel</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1F4E78">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+    background: #f4f6f8;
+    margin: 0;
+    padding: 0;
+    color: #222;
+  }
+  header {
+    background: #1F4E78;
+    color: white;
+    padding: 22px 16px 18px;
+    text-align: center;
+  }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 6px 0 0; font-size: 13px; opacity: 0.9; }
+  main {
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 18px 16px 40px;
+  }
+  .card {
+    background: white;
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  }
+  #pickBtn, #convertBtn {
+    width: 100%;
+    padding: 15px;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  #pickBtn { background: #eef2f5; color: #1F4E78; border: 2px dashed #1F4E78; }
+  #convertBtn { background: #1F4E78; color: white; margin-top: 14px; }
+  #convertBtn:disabled { background: #aab7c0; cursor: not-allowed; }
+  #fileInput { display: none; }
+  #fileList { margin-top: 10px; font-size: 13px; color: #555; line-height: 1.7; }
+  .opt-row { display: flex; align-items: center; gap: 8px; font-size: 13.5px; margin-top: 10px; }
+  #progressWrap { margin-top: 14px; display: none; }
+  #progressBar { width: 100%; height: 10px; background: #e3e7ea; border-radius: 6px; overflow: hidden; }
+  #progressFill { height: 100%; width: 0%; background: #1F4E78; transition: width .2s; }
+  #statusText { font-size: 12.5px; color: #555; margin-top: 6px; text-align: center; }
+  .note { font-size: 12px; color: #888; line-height: 1.8; }
+  .warn { background: #fff7e6; border: 1px solid #ffd580; border-radius: 10px; padding: 12px; font-size: 12.5px; color: #7a5200; line-height: 1.8; }
+  #installHint { display:none; background:#eaf3ff; border:1px solid #bcd6f5; border-radius:10px; padding:12px; font-size:12.5px; color:#1F4E78; margin-bottom:16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📄 محوّل PDF إلى Excel</h1>
+  <p>عربي · تلقائي التنسيق · يشتغل من غير إنترنت بعد أول تشغيل</p>
+</header>
+
+<main>
+  <div id="installHint" class="card"></div>
+
+  <div class="card">
+    <button id="pickBtn">📂 اختيار ملف PDF من الجهاز</button>
+    <input type="file" id="fileInput" accept="application/pdf" multiple>
+    <div id="fileList"></div>
+
+    <div class="opt-row">
+      <input type="checkbox" id="ocrToggle" checked>
+      <label for="ocrToggle">تفعيل قراءة النص من الصور الممسوحة (OCR عربي)</label>
+    </div>
+
+    <button id="convertBtn" disabled>🔄 تحويل إلى Excel</button>
+
+    <div id="progressWrap">
+      <div id="progressBar"><div id="progressFill"></div></div>
+      <div id="statusText">جاهز...</div>
+    </div>
+  </div>
+
+  <div class="warn">
+    ⚠️ أول مرة تفتح الأداة، لازم يكون فيه إنترنت لمرة واحدة بس (عشان يحمّل مكتبات
+    القراءة وملف اللغة العربية، حوالي ٣-٥ ميجا). بعد كده هتشتغل من غير إنترنت
+    نهائيًا، حتى لو قفلت النت أو الطيران.
+  </div>
+
+  <div class="card note">
+    <b>حدود حقيقية:</b><br>
+    ١) جداول من غير خطوط فاصلة وغير منتظمة ممكن يحصل فيها خطأ بسيط في فصل الأعمدة.<br>
+    ٢) سكان بجودة واطية (أقل من ١٥٠ dpi) → دقة OCR بتقل.<br>
+    ٣) أختام وتوقيعات وخط اليد: الـ OCR مش هيقرأها صح، راجعها يدويًا.<br>
+    ٤) التحويل بيحصل جوه المتصفح نفسه (مفيش رفع ملفات لأي سيرفر) — بياناتك متسربتش لحد.
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script src="app.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(function(e){ console.warn('SW failed', e); });
+  }
+  window.addEventListener('beforeinstallprompt', function (e) {
+    e.preventDefault();
+    window.deferredInstallPrompt = e;
+    var hint = document.getElementById('installHint');
+    hint.style.display = 'block';
+    hint.innerHTML = '📲 تقدر تثبّت الأداة كأيقونة على شاشتك الرئيسية. <button id="pwaInstallBtn" style="margin-inline-start:6px;padding:6px 12px;border:none;border-radius:8px;background:#1F4E78;color:white;">تثبيت</button>';
+    document.getElementById('pwaInstallBtn').onclick = function () {
+      window.deferredInstallPrompt.prompt();
+    };
+  });
+</script>
+
+</body>
+</html>
